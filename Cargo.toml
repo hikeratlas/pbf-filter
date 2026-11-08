@@ -1,0 +1,17 @@
+[package]
+name = "pbf-filter"
+version = "0.1.0"
+edition = "2024"
+description = "Write the smallest PBF that tilemaker profiles need"
+license = "MIT"
+
+[dependencies]
+flate2 = "1"
+memmap2 = "0.9"
+mlua = { version = "0.10", features = ["luajit", "vendored"] }
+rayon = "1"
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

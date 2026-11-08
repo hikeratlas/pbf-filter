@@ -7,13 +7,17 @@
 # compares the outputs: features tile by tile for a slice, lines for an
 # export. Same output means the filter kept everything the profile reads.
 #
-# TILEMAKER is the tilemaker binary (default: tilemaker). The checkout
+# TILEMAKER is the tilemaker binary (default: tilemaker); PBF_FILTER, if
+# set, is the pbf-filter binary to filter with instead of filter.py. The checkout
 # needs what the profiles read besides the PBF: ../qrank.db, the GeoJSON
 # inputs. A slice's shapefile layers are left out of both runs.
 set -uo pipefail
 basemap=$(readlink -f "$1") pbf=$(readlink -f "$2") work=$(readlink -f "$3") bbox=$4
 here=$(dirname "$(readlink -f "$0")")
 tm=${TILEMAKER:-tilemaker}
+filt() {
+  if [ -n "${PBF_FILTER:-}" ]; then "$PBF_FILTER" filter "$1" "$2" "$3"; else python3 "$here/filter.py" "$1" "$2" "$3"; fi
+}
 mkdir -p "$work"
 printf '%-24s %9s %9s  %s\n' profile full_MB filtered_MB result
 for lua in "$basemap"/slices/*.lua; do
@@ -21,7 +25,7 @@ for lua in "$basemap"/slices/*.lua; do
   json="$basemap/slices/$name.json"
   [ -f "$json" ] || continue
   filtered="$work/slice-$name.osm.pbf"
-  python3 "$here/filter.py" "$pbf" "$filtered" "$lua" 2> "$work/slice-$name.filter.log" || { echo "$name: filter failed"; continue; }
+  filt "$pbf" "$filtered" "$lua" 2> "$work/slice-$name.filter.log" || { echo "$name: filter failed"; continue; }
   # Without shapefile layers (e.g. the coastline): not from the PBF.
   python3 -c "
 import json, sys
@@ -43,7 +47,7 @@ for lua in "$basemap"/export/*.lua; do
   name=$(basename "$lua" .lua)
   grep -q '^function \(way\|node\|relation\)_function' "$lua" || continue  # modules
   filtered="$work/export-$name.osm.pbf"
-  python3 "$here/filter.py" "$pbf" "$filtered" "$lua" 2> "$work/export-$name.filter.log" || { echo "$name: filter failed"; continue; }
+  filt "$pbf" "$filtered" "$lua" 2> "$work/export-$name.filter.log" || { echo "$name: filter failed"; continue; }
   for v in full filtered; do
     input=$pbf; [ $v = filtered ] && input=$filtered
     mkdir -p "$work/export-$v"
