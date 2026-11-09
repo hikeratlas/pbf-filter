@@ -62,6 +62,112 @@ impl NodeSet {
     }
 }
 
+/// The node ids a file has, each with its rank (its position among them),
+/// so a group can mark kept nodes in a bitmap of one bit per node in the
+/// file rather than one per possible id.
+pub struct IdIndex {
+    exists: NodeSet,
+    /// Per allocated chunk of `exists`: the rank of its first id, and the
+    /// number of ids before each run of 8 words (512 ids) in it.
+    ranks: Vec<Option<(u64, Box<[u32]>)>>,
+    count: u64,
+}
+
+impl IdIndex {
+    /// From a read of the node blocks' ids.
+    fn build(data: &[u8], node_blobs: &[BlobRef]) -> Result<IdIndex, String> {
+        let exists = NodeSet::new();
+        node_blobs.par_iter().try_for_each(|blob| -> Result<(), String> {
+            let raw = pbf::read_blob(data, blob)?;
+            Block::parse(&raw).node_ids(|id| exists.insert(id));
+            Ok(())
+        })?;
+        let mut ranks = Vec::with_capacity(exists.chunks.len());
+        let mut count = 0u64;
+        for chunk in &exists.chunks {
+            match chunk.get() {
+                Some(words) => {
+                    let base = count;
+                    let mut prefix = Vec::with_capacity(words.len() / 8);
+                    let mut within = 0u32;
+                    for run in words.chunks(8) {
+                        prefix.push(within);
+                        within += run.iter().map(|w| w.load(Relaxed).count_ones()).sum::<u32>();
+                    }
+                    count += within as u64;
+                    ranks.push(Some((base, prefix.into_boxed_slice())));
+                }
+                None => ranks.push(None),
+            }
+        }
+        Ok(IdIndex { exists, ranks, count })
+    }
+
+    /// The id's rank, if the file has it.
+    fn rank(&self, id: i64) -> Option<u64> {
+        let id = id as u64;
+        let c = (id / CHUNK_BITS) as usize;
+        let (base, prefix) = self.ranks.get(c)?.as_ref()?;
+        let words = self.exists.chunks[c].get()?;
+        let bit = id % CHUNK_BITS;
+        let w = (bit / 64) as usize;
+        let mask = 1u64 << (bit % 64);
+        let word = words[w].load(Relaxed);
+        if word & mask == 0 {
+            return None;
+        }
+        let run = w / 8 * 8;
+        let before: u32 = words[run..w].iter().map(|x| x.load(Relaxed).count_ones()).sum();
+        Some(base + prefix[w / 8] as u64 + before as u64 + (word & (mask - 1)).count_ones() as u64)
+    }
+
+    /// Bytes it takes.
+    fn bytes(&self) -> u64 {
+        self.ranks.iter().flatten().map(|(_, p)| CHUNK_BITS / 8 + p.len() as u64 * 4).sum()
+    }
+}
+
+/// The nodes a group keeps: a bitmap over every possible id, or over the
+/// file's nodes by rank.
+enum Marks<'a> {
+    Full(NodeSet),
+    Ranked(&'a IdIndex, Box<[AtomicU64]>),
+}
+
+impl Marks<'_> {
+    fn insert(&self, id: i64) {
+        match self {
+            Marks::Full(s) => s.insert(id),
+            // A node the file doesn't have (e.g. outside an extract) can't
+            // be written anyway.
+            Marks::Ranked(index, bits) => {
+                if let Some(r) = index.rank(id) {
+                    bits[(r / 64) as usize].fetch_or(1 << (r % 64), Relaxed);
+                }
+            }
+        }
+    }
+    fn contains(&self, id: i64) -> bool {
+        match self {
+            Marks::Full(s) => s.contains(id),
+            Marks::Ranked(index, bits) => index.rank(id).is_some_and(|r| bits[(r / 64) as usize].load(Relaxed) & (1 << (r % 64)) != 0),
+        }
+    }
+}
+
+/// How groups mark the nodes they keep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NodeIndex {
+    /// A bitmap over every possible id per group: no extra read, but about
+    /// 1.8 GB each for OSM today.
+    Full,
+    /// A read of the node ids first, then a bitmap of one bit per node in
+    /// the file per group.
+    Ranked,
+    /// Full if every group fits in memory at once, else ranked.
+    Auto,
+}
+
 pub struct Stats {
     pub nodes: (u64, u64),
     pub ways: (u64, u64),
@@ -176,43 +282,77 @@ fn mem_available() -> Option<u64> {
 
 /// Writes one filtered PBF.
 pub fn filter(input: &str, output: &str, profiles: Vec<Profile>, c: Compression) -> Result<Stats, String> {
-    let mut stats = filter_groups(input, vec![Group { output: output.to_string(), profiles }], c, None)?;
+    let mut stats = filter_groups(input, vec![Group { output: output.to_string(), profiles }], c, None, NodeIndex::Auto)?;
     Ok(stats.remove(0))
 }
 
 /// Writes every group's filtered PBF, reading the input once for as many
-/// groups as memory allows: each needs a bitmap of the node ids it keeps
-/// (one bit per id up to the highest). `per_pass` overrides that.
-pub fn filter_groups(input: &str, groups: Vec<Group>, c: Compression, per_pass: Option<usize>) -> Result<Vec<Stats>, String> {
+/// groups as memory allows: each needs a bitmap of the node ids it keeps.
+/// With full bitmaps (one bit per possible id) that's about 1.8 GB a group;
+/// when they don't all fit, a read of the node ids first lets each take one
+/// bit per node in the file instead. `per_pass` overrides the batching.
+pub fn filter_groups(
+    input: &str,
+    groups: Vec<Group>,
+    c: Compression,
+    per_pass: Option<usize>,
+    index: NodeIndex,
+) -> Result<Vec<Stats>, String> {
+    let t0 = Instant::now();
     let file = File::open(input).map_err(|e| format!("{input}: {e}"))?;
     let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{input}: {e}"))?;
     let data: &[u8] = &map;
     let blobs = pbf::index(data)?;
     let (head, start, first_way, first_rel) = sections(input, data, &blobs)?;
-    let bitmap = (max_node_id(data, &blobs[start..first_way])? as u64 / 8).max(1);
-    let per_pass = per_pass.unwrap_or_else(|| match mem_available() {
-        // Leave a third for the blocks in flight and the rest of the system.
-        Some(avail) => ((avail * 2 / 3) / bitmap).max(1) as usize,
+    let node_blobs = &blobs[start..first_way];
+    let full = (max_node_id(data, node_blobs)? as u64 / 8).max(1);
+    // Leave a third for the blocks in flight and the rest of the system.
+    let budget = mem_available().map(|a| a * 2 / 3);
+    let fits = |each: u64, fixed: u64| match budget {
+        Some(b) => (b.saturating_sub(fixed) / each.max(1)).max(1) as usize,
         None => groups.len(),
+    };
+    let ranked = match index {
+        NodeIndex::Full => false,
+        NodeIndex::Ranked => true,
+        NodeIndex::Auto => per_pass.is_none() && groups.len() > 1 && fits(full, 0) < groups.len(),
+    };
+    let ids = if ranked {
+        let ids = IdIndex::build(data, node_blobs)?;
+        eprintln!(
+            "node index: {} nodes, {} MB, then {} MB per group ({:.1}s)",
+            ids.count,
+            ids.bytes() / 1_000_000,
+            ids.count / 8 / 1_000_000,
+            t0.elapsed().as_secs_f64()
+        );
+        Some(ids)
+    } else {
+        None
+    };
+    let per_pass = per_pass.unwrap_or_else(|| match &ids {
+        Some(ids) => fits(ids.count / 8, ids.bytes()),
+        None => fits(full, 0),
     });
     // As few reads as that allows, with the groups spread evenly over them.
     let reads = groups.len().div_ceil(per_pass.max(1));
     let per_pass = groups.len().div_ceil(reads.max(1)).max(1);
     if per_pass < groups.len() {
-        eprintln!("{} groups, {per_pass} per read of the input (node bitmaps of {} MB each)", groups.len(), bitmap / 1_000_000);
+        let each = ids.as_ref().map_or(full, |i| i.count / 8);
+        eprintln!("{} groups, {per_pass} per read of the input (node bitmaps of {} MB each)", groups.len(), each / 1_000_000);
     }
     let mut stats = vec![];
     let mut groups = groups.into_iter().peekable();
     while groups.peek().is_some() {
         let batch: Vec<Group> = groups.by_ref().take(per_pass).collect();
-        stats.extend(filter_pass(data, &blobs, &head, (start, first_way, first_rel), &batch, c)?);
+        stats.extend(filter_pass(data, &blobs, &head, (start, first_way, first_rel), &batch, ids.as_ref(), c)?);
     }
     Ok(stats)
 }
 
 /// Per-group state through the passes.
-struct State {
-    nodes: NodeSet,
+struct State<'a> {
+    nodes: Marks<'a>,
     member_ways: HashSet<i64>,
     rel_frames: Vec<Vec<u8>>,
     stats: Stats,
@@ -224,6 +364,7 @@ fn filter_pass(
     head: &[u8],
     (start, first_way, first_rel): (usize, usize, usize),
     groups: &[Group],
+    ids: Option<&IdIndex>,
     c: Compression,
 ) -> Result<Vec<Stats>, String> {
     let t0 = Instant::now();
@@ -244,7 +385,10 @@ fn filter_pass(
     let mut state: Vec<State> = groups
         .iter()
         .map(|_| State {
-            nodes: NodeSet::new(),
+            nodes: match ids {
+                Some(ids) => Marks::Ranked(ids, (0..ids.count.div_ceil(64)).map(|_| AtomicU64::new(0)).collect()),
+                None => Marks::Full(NodeSet::new()),
+            },
             member_ways: HashSet::new(),
             rel_frames: vec![],
             stats: Stats { nodes: (0, 0), ways: (0, 0), relations: (0, 0) },

@@ -174,6 +174,26 @@ impl<'a> Block<'a> {
         }
     }
 
+    /// Just the node ids, in order: cheaper than `nodes` (no tags or
+    /// coordinates).
+    pub fn node_ids(&self, mut f: impl FnMut(i64)) {
+        for &(gf, msg) in &self.groups {
+            match gf {
+                2 => {
+                    if let Some((_, v)) = fields(msg).find(|(nf, _)| *nf == 1) {
+                        deltas(v.bytes()).for_each(&mut f);
+                    }
+                }
+                1 => {
+                    if let Some((_, v)) = fields(msg).find(|(nf, _)| *nf == 1) {
+                        f(unzigzag(v.varint()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn dense(&self, msg: &[u8], f: &mut impl FnMut(Node)) {
         let (mut ids, mut lats, mut lons, mut kv) = (&[][..], &[][..], &[][..], &[][..]);
         for (nf, v) in fields(msg) {
