@@ -43,7 +43,7 @@ pub fn recompress(input: &str, output: &str, c: Compression) -> Result<(), Strin
     let data: &[u8] = &map;
     let head = header_of(data, &blobs)?;
     let mut out = BufWriter::new(File::create(output).map_err(|e| format!("{output}: {e}"))?);
-    out.write_all(&frame("OSMHeader", &header::header_block(Some(&head), header::is_sorted(&head)), c)).map_err(|e| e.to_string())?;
+    out.write_all(&frame("OSMHeader", &header::header_block(Some(&head), header::is_sorted(&head), None), c)).map_err(|e| e.to_string())?;
     let data_blobs: Vec<&BlobRef> = blobs.iter().filter(|b| !b.is_header).collect();
     for window in data_blobs.chunks(WINDOW) {
         let frames: Vec<Result<Vec<u8>, String>> = window
@@ -174,7 +174,7 @@ pub fn merge(inputs: &[String], output: &str, c: Compression) -> Result<(), Stri
         cursors.push(cur);
     }
     let mut out = BufWriter::new(File::create(output).map_err(|e| format!("{output}: {e}"))?);
-    out.write_all(&frame("OSMHeader", &header::header_block(None, true), c)).map_err(|e| e.to_string())?;
+    out.write_all(&frame("OSMHeader", &header::header_block(None, true, None), c)).map_err(|e| e.to_string())?;
     let (mut b, mut kind, mut raw_blocks) = (BlockBuilder::new(), None, vec![]);
     let flush = |raw: &mut Vec<Vec<u8>>, out: &mut BufWriter<File>| -> Result<(), String> {
         let frames: Vec<Vec<u8>> = raw.par_iter().map(|r| frame("OSMData", r, c)).collect();

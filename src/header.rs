@@ -3,11 +3,16 @@
 
 use crate::proto::{fields, put_bytes, put_uint};
 
+/// A field of our own in the HeaderBlock, for a JSON record of how the file
+/// was made (`filter`'s profiles' rules, the source's size). Readers skip
+/// fields they don't know, as protocol buffers require.
+pub const RECORD_FIELD: u32 = 4242;
+
 /// A HeaderBlock for our output: the input's bounding box, source and
-/// replication fields (if any), its required features, and as optional
+/// replication fields (if any), its required features, as optional
 /// features only `Sort.Type_then_ID` if `sorted` (not, e.g., `Has_Metadata`,
-/// since metadata isn't written).
-pub fn header_block(input: Option<&[u8]>, sorted: bool) -> Vec<u8> {
+/// since metadata isn't written), and `record`, if any.
+pub fn header_block(input: Option<&[u8]>, sorted: bool, record: Option<&serde_json::Value>) -> Vec<u8> {
     let mut out = vec![];
     let mut required = vec![];
     if let Some(h) = input {
@@ -33,7 +38,15 @@ pub fn header_block(input: Option<&[u8]>, sorted: bool) -> Vec<u8> {
         put_bytes(&mut out, 5, b"Sort.Type_then_ID");
     }
     put_bytes(&mut out, 16, concat!("pbf-filter ", env!("CARGO_PKG_VERSION")).as_bytes());
+    if let Some(r) = record {
+        put_bytes(&mut out, RECORD_FIELD, r.to_string().as_bytes());
+    }
     out
+}
+
+/// The record a header carries, if any.
+pub fn record(header: &[u8]) -> Option<serde_json::Value> {
+    fields(header).find(|(f, _)| *f == RECORD_FIELD).and_then(|(_, v)| serde_json::from_slice(v.bytes()).ok())
 }
 
 pub fn is_sorted(header: &[u8]) -> bool {

@@ -75,7 +75,7 @@ fn kind_of(data: &[u8], b: &BlobRef) -> Result<Kind, String> {
 
 /// The first data blob (from `lo`) whose kind is at least `kind`, by
 /// binary search: the file is sorted by kind.
-fn first_of(data: &[u8], blobs: &[BlobRef], mut lo: usize, kind: Kind) -> Result<usize, String> {
+pub fn first_of(data: &[u8], blobs: &[BlobRef], mut lo: usize, kind: Kind) -> Result<usize, String> {
     let mut hi = blobs.len();
     while lo < hi {
         let mid = (lo + hi) / 2;
@@ -88,7 +88,21 @@ fn first_of(data: &[u8], blobs: &[BlobRef], mut lo: usize, kind: Kind) -> Result
     Ok(lo)
 }
 
-fn tag_bytes<'a>(b: &Block<'a>, tags: &[(u32, u32)]) -> Vec<(&'a [u8], &'a [u8])> {
+/// A sorted file's header block, and where its node, way and relation
+/// blobs start: (header, first node blob, first way blob, first relation blob).
+pub fn sections(input: &str, data: &[u8], blobs: &[BlobRef]) -> Result<(Vec<u8>, usize, usize, usize), String> {
+    let header = blobs.iter().position(|b| b.is_header).ok_or("no OSMHeader block")?;
+    let head = pbf::read_blob(data, &blobs[header])?;
+    if !crate::header::is_sorted(&head) {
+        return Err(format!("{input} isn't marked sorted (Sort.Type_then_ID)"));
+    }
+    let start = header + 1;
+    let first_way = first_of(data, blobs, start, Kind::Ways)?;
+    let first_rel = first_of(data, blobs, first_way, Kind::Relations)?;
+    Ok((head, start, first_way, first_rel))
+}
+
+pub fn tag_bytes<'a>(b: &Block<'a>, tags: &[(u32, u32)]) -> Vec<(&'a [u8], &'a [u8])> {
     tags.iter().map(|&(k, v)| (b.string(k), b.string(v))).collect()
 }
 
@@ -139,14 +153,7 @@ pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -
     let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{input}: {e}"))?;
     let data: &[u8] = &map;
     let blobs = pbf::index(data)?;
-    let header = blobs.iter().position(|b| b.is_header).ok_or("no OSMHeader block")?;
-    let head = pbf::read_blob(data, &blobs[header])?;
-    if !crate::header::is_sorted(&head) {
-        return Err(format!("{input} isn't marked sorted (Sort.Type_then_ID)"));
-    }
-    let start = header + 1;
-    let first_way = first_of(data, &blobs, start, Kind::Ways)?;
-    let first_rel = first_of(data, &blobs, first_way, Kind::Relations)?;
+    let (head, start, first_way, first_rel) = sections(input, data, &blobs)?;
     let (node_blobs, way_blobs, rel_blobs) = (&blobs[start..first_way], &blobs[first_way..first_rel], &blobs[first_rel..]);
     eprintln!(
         "{} blocks: {} nodes, {} ways, {} relations ({:.1}s)",
@@ -175,7 +182,7 @@ pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -
             }
             let tags = tag_bytes(&block, &r.tags);
             let multipolygon = tags.iter().any(|&(k, v)| k == b"type" && v == b"multipolygon");
-            let (mut keep, mut scanned) = (false, false);
+            let mut keep = false;
             for (p, rule) in profiles.iter().zip(&rules) {
                 // tilemaker reads a relation (its relation_function, or a
                 // multipolygon or boundary's area) if relation_scan_function
@@ -183,10 +190,7 @@ pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -
                 keep |= rule.keeps_way(tags.iter().copied());
                 if !multipolygon {
                     match p.accepts(r.id, &tags) {
-                        Ok(true) => {
-                            keep = true;
-                            scanned = true;
-                        }
+                        Ok(true) => keep = true,
                         Ok(false) => {}
                         Err(e) => err = Some(e),
                     }
@@ -201,9 +205,11 @@ pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -
                     Member::Way => {
                         member_ways.insert(id);
                     }
-                    // tilemaker keeps an accepted relation's member nodes,
-                    // not a multipolygon's.
-                    Member::Node if scanned => nodes.insert(id),
+                    // tilemaker keeps the member nodes of a relation its
+                    // relation_scan_function accepts (not a multipolygon's).
+                    // Kept for every non-multipolygon kept, so the PBF still
+                    // serves a profile that comes to accept one (see check).
+                    Member::Node if !multipolygon => nodes.insert(id),
                     _ => {}
                 }
             }
@@ -255,7 +261,11 @@ pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -
 
     // 3. Nodes, then the ways and relations after them.
     let mut out = BufWriter::new(File::create(output).map_err(|e| format!("{output}: {e}"))?);
-    out.write_all(&frame("OSMHeader", &crate::header::header_block(Some(&head), true), c)).map_err(|e| e.to_string())?;
+    let record = serde_json::json!({
+        "source_bytes": data.len(),
+        "profiles": rules.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+    });
+    out.write_all(&frame("OSMHeader", &crate::header::header_block(Some(&head), true, Some(&record)), c)).map_err(|e| e.to_string())?;
     let node_counts = (AtomicU64::new(0), AtomicU64::new(0));
     pass(data, node_blobs, c, &mut out, |block, b, full| {
         block.nodes(|n| {

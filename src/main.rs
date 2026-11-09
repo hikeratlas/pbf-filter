@@ -1,3 +1,4 @@
+mod check;
 mod copy;
 mod filter;
 mod header;
@@ -21,6 +22,14 @@ const USAGE: &str = "usage:
   pbf-filter recompress INPUT.osm.pbf OUTPUT.osm.pbf
       The same data, without metadata (versions, timestamps, changesets,
       users), in zstd blocks.
+  pbf-filter relations INPUT.osm.pbf OUTPUT.relations.pbf
+      Every relation of INPUT, with its tags and no members: the sidecar
+      `check` runs changed profiles on.
+  pbf-filter check FILTERED.osm.pbf RELATIONS.pbf PROFILE.lua [PROFILE.lua ...]
+      Whether FILTERED (from `filter`) still serves PROFILES, which may have
+      changed since: exits 0 if so, 3 (saying why) if they'd read something
+      it may not have, so a build can fall back to the whole PBF. RELATIONS
+      is the sidecar from the same PBF.
 
 options:
   --zlib       write zlib blocks (default: zstd, which cldellow/tilemaker reads)
@@ -98,6 +107,29 @@ fn main() {
             }
             copy::recompress(&pos[0], &pos[1], c).unwrap_or_else(|e| fail(e));
             eprintln!("{}: {:.1} of {:.1} MB; {:.1}s", pos[1], size(&pos[1]), size(&pos[0]), t0.elapsed().as_secs_f64());
+        }
+        "relations" => {
+            if pos.len() != 2 {
+                die("relations needs INPUT and OUTPUT");
+            }
+            let n = check::relations(&pos[0], &pos[1], c).unwrap_or_else(|e| fail(e));
+            eprintln!("{}: {n} relations, {:.1} MB; {:.1}s", pos[1], size(&pos[1]), t0.elapsed().as_secs_f64());
+        }
+        "check" => {
+            if pos.len() < 3 {
+                die("check needs FILTERED, RELATIONS and at least one PROFILE");
+            }
+            let profiles: Vec<profile::Profile> =
+                pos[2..].iter().map(|p| profile::Profile::load(Path::new(p))).collect::<Result<_, _>>().unwrap_or_else(|e| fail(e));
+            match check::check(&pos[0], &pos[1], &profiles).unwrap_or_else(|e| fail(e)) {
+                check::Verdict::Fresh { relations } => {
+                    eprintln!("{}: still serves the profiles ({relations} relations checked; {:.1}s)", pos[0], t0.elapsed().as_secs_f64())
+                }
+                check::Verdict::Stale(why) => {
+                    eprintln!("{}: stale: {why}", pos[0]);
+                    std::process::exit(3)
+                }
+            }
         }
         _ => die("unknown command"),
     }
