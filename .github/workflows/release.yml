@@ -1,0 +1,46 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds pbf-filter for Linux on x86_64 and arm64
+# (hikeratlas/basemap's jobs run on ubuntu-24.04-arm) and publishes them
+# as that release's assets: pbf-filter-x86_64-linux, pbf-filter-aarch64-linux.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      - run: cp target/release/pbf-filter pbf-filter-${{ matrix.arch }}-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pbf-filter-${{ matrix.arch }}-linux
+          path: pbf-filter-${{ matrix.arch }}-linux
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          chmod +x pbf-filter-*-linux
+          gh release create "$TAG" pbf-filter-*-linux --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
