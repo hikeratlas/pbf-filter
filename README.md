@@ -30,4 +30,5 @@ relation. No extra declarations.
   blocks. Every command drops metadata (versions, timestamps, users),
   which tilemaker doesn't read.
 
-Releases (`v*` tags) publish Linux binaries for x86_64 and arm64.
+Releases publish Linux binaries for x86_64 and arm64: run the Release
+workflow with a version (it tags the commit), or push a `v*` tag.
