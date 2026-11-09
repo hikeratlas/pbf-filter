@@ -31,19 +31,3 @@ relation. No extra declarations.
   which tilemaker doesn't read.
 
 Releases (`v*` tags) publish Linux binaries for x86_64 and arm64.
-
-## Prototype
-
-`prototype/` checks the idea before the real tool (a single-pass Rust
-program) is written:
-
-- `filter.py INPUT.osm.pbf OUTPUT.osm.pbf PROFILE.lua...` writes the
-  filtered PBF (pyosmium for the relation pass, the osmium tool for the
-  filtering).
-- `compare.sh BASEMAP_DIR INPUT.osm.pbf WORK_DIR BBOX` runs every profile in
-  a hikeratlas/basemap checkout on the input and on its filtered PBF, and
-  compares the outputs.
-
-On Nova Scotia (89 MB), every basemap profile that reads the PBF gave
-identical output from its filtered PBF, which ranged from under 0.1 MB
-(campgrounds, peaks) to 35 MB (land).
