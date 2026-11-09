@@ -11,6 +11,7 @@ relation. No extra declarations.
 ## Usage
 
     pbf-filter filter INPUT.osm.pbf OUTPUT.osm.pbf PROFILE.lua [PROFILE.lua ...]
+    pbf-filter groups INPUT.osm.pbf GROUPS.json OUTDIR
     pbf-filter relations INPUT.osm.pbf OUTPUT.relations.pbf
     pbf-filter check FILTERED.osm.pbf RELATIONS.pbf PROFILE.lua [PROFILE.lua ...]
     pbf-filter merge OUTPUT.osm.pbf INPUT.osm.pbf INPUT.osm.pbf [...]
@@ -20,6 +21,14 @@ relation. No extra declarations.
   then nodes, in parallel) and writes zstd blocks (`--zlib` for zlib),
   which cldellow/tilemaker reads. It records the profiles' keys in the
   output's header.
+- `groups` is `filter` for several groups of profiles at once
+  (GROUPS.json: `{"name": ["PROFILE.lua", ...]}`, paths relative to it),
+  writing `OUTDIR/<name>.zstd.pbf` with each block decoded once for all
+  of them. Each group needs a bitmap of the node ids it keeps (one bit
+  per id up to the highest, about 1.8 GB for OSM today), so it reads the
+  input as few times as memory allows, the groups spread evenly over the
+  reads (`--per-pass N` to choose). The outputs are the same, byte for
+  byte, as `filter` run once per group.
 - `check` says (exit 0, or 3 and why) whether a filtered PBF still serves
   profiles that may have changed: their keys must match no more than the
   recorded ones, and every relation they'd read (run on the `relations`

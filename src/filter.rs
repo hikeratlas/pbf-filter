@@ -107,196 +107,311 @@ pub fn tag_bytes<'a>(b: &Block<'a>, tags: &[(u32, u32)]) -> Vec<(&'a [u8], &'a [
 }
 
 /// Filters each window's blocks in parallel with `f`, which turns a block
-/// into kept entities in a builder, and writes the window's blocks in order.
-fn pass<F>(data: &[u8], blobs: &[BlobRef], c: Compression, out: &mut impl Write, f: F) -> Result<u64, String>
+/// into kept entities, one builder per output, and writes each output's
+/// blocks in order.
+fn pass<W: Write, F>(data: &[u8], blobs: &[BlobRef], c: Compression, outs: &mut [W], f: F) -> Result<(), String>
 where
-    F: Fn(&Block, &mut BlockBuilder, &mut Vec<Vec<u8>>) + Sync,
+    F: Fn(&Block, &mut [BlockBuilder], &mut [Vec<Vec<u8>>]) + Sync,
 {
-    let mut written = 0u64;
+    let n = outs.len();
     for window in blobs.chunks(WINDOW) {
         // Each task takes a run of blocks, so its output blocks are full.
         let runs: Vec<&[BlobRef]> = window.chunks(window.len().div_ceil(rayon::current_num_threads()).max(1)).collect();
-        let outs: Vec<Result<(Vec<Vec<u8>>, u64), String>> = runs
+        let results: Vec<Result<Vec<Vec<Vec<u8>>>, String>> = runs
             .par_iter()
             .map(|run| {
-                let (mut b, mut frames, mut n) = (BlockBuilder::new(), vec![], 0u64);
+                let mut builders: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
+                let mut frames: Vec<Vec<Vec<u8>>> = vec![vec![]; n];
+                let mut full: Vec<Vec<Vec<u8>>> = vec![vec![]; n];
                 for blob in *run {
                     let raw = pbf::read_blob(data, blob)?;
                     let block = Block::parse(&raw);
-                    let mut full = vec![];
-                    f(&block, &mut b, &mut full);
-                    for block in full {
-                        frames.push(frame("OSMData", &block, c));
+                    f(&block, &mut builders, &mut full);
+                    for (g, blocks) in full.iter_mut().enumerate() {
+                        for block in blocks.drain(..) {
+                            frames[g].push(frame("OSMData", &block, c));
+                        }
                     }
                 }
-                if b.len() > 0 {
-                    n += b.len() as u64;
-                    frames.push(frame("OSMData", &b.finish(), c));
+                for (g, b) in builders.iter_mut().enumerate() {
+                    if b.len() > 0 {
+                        frames[g].push(frame("OSMData", &b.finish(), c));
+                    }
                 }
-                Ok((frames, n))
+                Ok(frames)
             })
             .collect();
-        for o in outs {
-            let (frames, _) = o?;
-            for fr in frames {
-                out.write_all(&fr).map_err(|e| e.to_string())?;
-                written += 1;
+        for r in results {
+            for (out, frames) in outs.iter_mut().zip(r?) {
+                for fr in frames {
+                    out.write_all(&fr).map_err(|e| e.to_string())?;
+                }
             }
         }
     }
-    Ok(written)
+    Ok(())
 }
 
-pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -> Result<Stats, String> {
-    let t0 = Instant::now();
+/// One filtered PBF to write: what `profiles` read.
+pub struct Group {
+    pub output: String,
+    pub profiles: Vec<Profile>,
+}
+
+/// The highest node id in the file: the last node block's last.
+fn max_node_id(data: &[u8], node_blobs: &[BlobRef]) -> Result<i64, String> {
+    let Some(last) = node_blobs.last() else { return Ok(0) };
+    let raw = pbf::read_blob(data, last)?;
+    let mut max = 0;
+    Block::parse(&raw).nodes(|n| max = max.max(n.id));
+    Ok(max)
+}
+
+/// Memory the system can still give, from /proc/meminfo.
+fn mem_available() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    Some(line.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024)
+}
+
+/// Writes one filtered PBF.
+pub fn filter(input: &str, output: &str, profiles: Vec<Profile>, c: Compression) -> Result<Stats, String> {
+    let mut stats = filter_groups(input, vec![Group { output: output.to_string(), profiles }], c, None)?;
+    Ok(stats.remove(0))
+}
+
+/// Writes every group's filtered PBF, reading the input once for as many
+/// groups as memory allows: each needs a bitmap of the node ids it keeps
+/// (one bit per id up to the highest). `per_pass` overrides that.
+pub fn filter_groups(input: &str, groups: Vec<Group>, c: Compression, per_pass: Option<usize>) -> Result<Vec<Stats>, String> {
     let file = File::open(input).map_err(|e| format!("{input}: {e}"))?;
     let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{input}: {e}"))?;
     let data: &[u8] = &map;
     let blobs = pbf::index(data)?;
     let (head, start, first_way, first_rel) = sections(input, data, &blobs)?;
+    let bitmap = (max_node_id(data, &blobs[start..first_way])? as u64 / 8).max(1);
+    let per_pass = per_pass.unwrap_or_else(|| match mem_available() {
+        // Leave a third for the blocks in flight and the rest of the system.
+        Some(avail) => ((avail * 2 / 3) / bitmap).max(1) as usize,
+        None => groups.len(),
+    });
+    // As few reads as that allows, with the groups spread evenly over them.
+    let reads = groups.len().div_ceil(per_pass.max(1));
+    let per_pass = groups.len().div_ceil(reads.max(1)).max(1);
+    if per_pass < groups.len() {
+        eprintln!("{} groups, {per_pass} per read of the input (node bitmaps of {} MB each)", groups.len(), bitmap / 1_000_000);
+    }
+    let mut stats = vec![];
+    let mut groups = groups.into_iter().peekable();
+    while groups.peek().is_some() {
+        let batch: Vec<Group> = groups.by_ref().take(per_pass).collect();
+        stats.extend(filter_pass(data, &blobs, &head, (start, first_way, first_rel), &batch, c)?);
+    }
+    Ok(stats)
+}
+
+/// Per-group state through the passes.
+struct State {
+    nodes: NodeSet,
+    member_ways: HashSet<i64>,
+    rel_frames: Vec<Vec<u8>>,
+    stats: Stats,
+}
+
+fn filter_pass(
+    data: &[u8],
+    blobs: &[BlobRef],
+    head: &[u8],
+    (start, first_way, first_rel): (usize, usize, usize),
+    groups: &[Group],
+    c: Compression,
+) -> Result<Vec<Stats>, String> {
+    let t0 = Instant::now();
     let (node_blobs, way_blobs, rel_blobs) = (&blobs[start..first_way], &blobs[first_way..first_rel], &blobs[first_rel..]);
+    let names: Vec<String> = groups
+        .iter()
+        .map(|g| std::path::Path::new(&g.output).file_name().map_or(g.output.clone(), |n| n.to_string_lossy().into_owned()))
+        .collect();
     eprintln!(
-        "{} blocks: {} nodes, {} ways, {} relations ({:.1}s)",
+        "{}: {} blocks: {} nodes, {} ways, {} relations",
+        names.join(", "),
         blobs.len(),
         node_blobs.len(),
         way_blobs.len(),
         rel_blobs.len(),
-        t0.elapsed().as_secs_f64()
     );
-    let rules: Vec<Rules> = profiles.iter().map(|p| p.rules.clone()).collect();
-    let mut stats = Stats { nodes: (0, 0), ways: (0, 0), relations: (0, 0) };
+    let rules: Vec<Vec<Rules>> = groups.iter().map(|g| g.profiles.iter().map(|p| p.rules.clone()).collect()).collect();
+    let mut state: Vec<State> = groups
+        .iter()
+        .map(|_| State {
+            nodes: NodeSet::new(),
+            member_ways: HashSet::new(),
+            rel_frames: vec![],
+            stats: Stats { nodes: (0, 0), ways: (0, 0), relations: (0, 0) },
+        })
+        .collect();
 
     // 1. Relations (Lua, so on this thread).
-    let nodes = NodeSet::new();
-    let mut member_ways: HashSet<i64> = HashSet::new();
-    let mut rel_out = BlockBuilder::new();
-    let mut rel_frames = vec![];
+    let mut rel_out: Vec<BlockBuilder> = groups.iter().map(|_| BlockBuilder::new()).collect();
     for blob in rel_blobs {
         let raw = pbf::read_blob(data, blob)?;
         let block = Block::parse(&raw);
         let mut err = None;
         block.relations(|r| {
-            stats.relations.0 += 1;
             if err.is_some() {
                 return;
             }
             let tags = tag_bytes(&block, &r.tags);
             let multipolygon = tags.iter().any(|&(k, v)| k == b"type" && v == b"multipolygon");
-            let mut keep = false;
-            for (p, rule) in profiles.iter().zip(&rules) {
-                // tilemaker reads a relation (its relation_function, or a
-                // multipolygon or boundary's area) if relation_scan_function
-                // accepted it, or if its tags match way_keys, whatever its type.
-                keep |= rule.keeps_way(tags.iter().copied());
-                if !multipolygon {
-                    match p.accepts(r.id, &tags) {
-                        Ok(true) => keep = true,
-                        Ok(false) => {}
-                        Err(e) => err = Some(e),
+            for (g, group) in groups.iter().enumerate() {
+                let s = &mut state[g];
+                s.stats.relations.0 += 1;
+                let mut keep = false;
+                for (p, rule) in group.profiles.iter().zip(&rules[g]) {
+                    // tilemaker reads a relation (its relation_function, or a
+                    // multipolygon or boundary's area) if relation_scan_function
+                    // accepted it, or if its tags match way_keys, whatever its type.
+                    keep |= rule.keeps_way(tags.iter().copied());
+                    if !multipolygon {
+                        match p.accepts(r.id, &tags) {
+                            Ok(true) => keep = true,
+                            Ok(false) => {}
+                            Err(e) => err = Some(e),
+                        }
                     }
                 }
-            }
-            if !keep {
-                return;
-            }
-            stats.relations.1 += 1;
-            for &(t, id, _) in &r.members {
-                match t {
-                    Member::Way => {
-                        member_ways.insert(id);
-                    }
-                    // tilemaker keeps the member nodes of a relation its
-                    // relation_scan_function accepts (not a multipolygon's).
-                    // Kept for every non-multipolygon kept, so the PBF still
-                    // serves a profile that comes to accept one (see check).
-                    Member::Node if !multipolygon => nodes.insert(id),
-                    _ => {}
+                if !keep {
+                    continue;
                 }
-            }
-            rel_out.add_relation(r.id, tags.iter().copied(), r.members.iter().map(|&(t, id, role)| (t, id, block.string(role))));
-            if rel_out.is_full() {
-                rel_frames.push(frame("OSMData", &rel_out.finish(), c));
+                s.stats.relations.1 += 1;
+                for &(t, id, _) in &r.members {
+                    match t {
+                        Member::Way => {
+                            s.member_ways.insert(id);
+                        }
+                        // tilemaker keeps the member nodes of a relation its
+                        // relation_scan_function accepts (not a multipolygon's).
+                        // Kept for every non-multipolygon kept, so the PBF still
+                        // serves a profile that comes to accept one (see check).
+                        Member::Node if !multipolygon => s.nodes.insert(id),
+                        _ => {}
+                    }
+                }
+                let out = &mut rel_out[g];
+                out.add_relation(r.id, tags.iter().copied(), r.members.iter().map(|&(t, id, role)| (t, id, block.string(role))));
+                if out.is_full() {
+                    s.rel_frames.push(frame("OSMData", &out.finish(), c));
+                }
             }
         });
         if let Some(e) = err {
             return Err(e);
         }
     }
-    if rel_out.len() > 0 {
-        rel_frames.push(frame("OSMData", &rel_out.finish(), c));
+    for (s, out) in state.iter_mut().zip(&mut rel_out) {
+        if out.len() > 0 {
+            s.rel_frames.push(frame("OSMData", &out.finish(), c));
+        }
     }
-    eprintln!("relations: kept {} of {} ({:.1}s)", stats.relations.1, stats.relations.0, t0.elapsed().as_secs_f64());
+    eprintln!("relations ({:.1}s)", t0.elapsed().as_secs_f64());
 
-    // 2. Ways, into a temporary file beside the output.
-    let tmp_path = format!("{output}.ways.tmp");
-    let tmp_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
-        .map_err(|e| format!("{tmp_path}: {e}"))?;
-    let mut tmp = BufWriter::new(tmp_file);
-    let way_counts = (AtomicU64::new(0), AtomicU64::new(0));
-    pass(data, way_blobs, c, &mut tmp, |block, b, full| {
-        block.ways(|w| {
-            way_counts.0.fetch_add(1, Relaxed);
-            let tags = tag_bytes(block, &w.tags);
-            if !(member_ways.contains(&w.id) || rules.iter().any(|r| r.keeps_way(tags.iter().copied()))) {
-                return;
-            }
-            way_counts.1.fetch_add(1, Relaxed);
-            for &n in &w.refs {
-                nodes.insert(n);
-            }
-            b.add_way(w.id, tags.iter().copied(), &w.refs);
-            if b.is_full() {
-                full.push(b.finish());
-            }
-        });
-    })?;
-    let mut tmp = tmp.into_inner().map_err(|e| e.to_string())?;
-    stats.ways = (way_counts.0.into_inner(), way_counts.1.into_inner());
-    eprintln!("ways: kept {} of {} ({:.1}s)", stats.ways.1, stats.ways.0, t0.elapsed().as_secs_f64());
+    // 2. Ways, into a temporary file beside each output.
+    let mut tmps = vec![];
+    for g in groups {
+        let path = format!("{}.ways.tmp", g.output);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| format!("{path}: {e}"))?;
+        tmps.push((path, BufWriter::new(f)));
+    }
+    let counts: Vec<(AtomicU64, AtomicU64)> = groups.iter().map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect();
+    {
+        let mut outs: Vec<&mut BufWriter<File>> = tmps.iter_mut().map(|(_, w)| w).collect();
+        let state = &state;
+        pass(data, way_blobs, c, &mut outs, |block, builders, full| {
+            block.ways(|w| {
+                let tags = tag_bytes(block, &w.tags);
+                for (g, s) in state.iter().enumerate() {
+                    counts[g].0.fetch_add(1, Relaxed);
+                    if !(s.member_ways.contains(&w.id) || rules[g].iter().any(|r| r.keeps_way(tags.iter().copied()))) {
+                        continue;
+                    }
+                    counts[g].1.fetch_add(1, Relaxed);
+                    for &n in &w.refs {
+                        s.nodes.insert(n);
+                    }
+                    let b = &mut builders[g];
+                    b.add_way(w.id, tags.iter().copied(), &w.refs);
+                    if b.is_full() {
+                        full[g].push(b.finish());
+                    }
+                }
+            });
+        })?;
+    }
+    for (s, c) in state.iter_mut().zip(&counts) {
+        s.stats.ways = (c.0.load(Relaxed), c.1.load(Relaxed));
+    }
+    eprintln!("ways ({:.1}s)", t0.elapsed().as_secs_f64());
 
     // 3. Nodes, then the ways and relations after them.
-    let mut out = BufWriter::new(File::create(output).map_err(|e| format!("{output}: {e}"))?);
-    let record = serde_json::json!({
-        "source_bytes": data.len(),
-        "profiles": rules.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
-    });
-    out.write_all(&frame("OSMHeader", &crate::header::header_block(Some(&head), true, Some(&record)), c)).map_err(|e| e.to_string())?;
-    let node_counts = (AtomicU64::new(0), AtomicU64::new(0));
-    pass(data, node_blobs, c, &mut out, |block, b, full| {
-        block.nodes(|n| {
-            node_counts.0.fetch_add(1, Relaxed);
-            let tags = tag_bytes(block, &n.tags);
-            if !(nodes.contains(n.id) || rules.iter().any(|r| r.keeps_node(&tags))) {
-                return;
-            }
-            node_counts.1.fetch_add(1, Relaxed);
-            b.add_node(n.id, n.lat, n.lon, tags.iter().copied());
-            if b.is_full() {
-                full.push(b.finish());
-            }
+    let mut outs = vec![];
+    for (g, group) in groups.iter().enumerate() {
+        let mut out = BufWriter::new(File::create(&group.output).map_err(|e| format!("{}: {e}", group.output))?);
+        let record = serde_json::json!({
+            "source_bytes": data.len(),
+            "profiles": rules[g].iter().map(|r| r.to_json()).collect::<Vec<_>>(),
         });
-    })?;
-    stats.nodes = (node_counts.0.into_inner(), node_counts.1.into_inner());
-    eprintln!("nodes: kept {} of {} ({:.1}s)", stats.nodes.1, stats.nodes.0, t0.elapsed().as_secs_f64());
-    tmp.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        out.write_all(&frame("OSMHeader", &crate::header::header_block(Some(head), true, Some(&record)), c))
+            .map_err(|e| e.to_string())?;
+        outs.push(out);
+    }
+    let counts: Vec<(AtomicU64, AtomicU64)> = groups.iter().map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect();
+    {
+        let state = &state;
+        pass(data, node_blobs, c, &mut outs, |block, builders, full| {
+            block.nodes(|n| {
+                let tags = tag_bytes(block, &n.tags);
+                for (g, s) in state.iter().enumerate() {
+                    counts[g].0.fetch_add(1, Relaxed);
+                    if !(s.nodes.contains(n.id) || rules[g].iter().any(|r| r.keeps_node(&tags))) {
+                        continue;
+                    }
+                    counts[g].1.fetch_add(1, Relaxed);
+                    let b = &mut builders[g];
+                    b.add_node(n.id, n.lat, n.lon, tags.iter().copied());
+                    if b.is_full() {
+                        full[g].push(b.finish());
+                    }
+                }
+            });
+        })?;
+    }
+    for (s, c) in state.iter_mut().zip(&counts) {
+        s.stats.nodes = (c.0.load(Relaxed), c.1.load(Relaxed));
+    }
+    eprintln!("nodes ({:.1}s)", t0.elapsed().as_secs_f64());
     let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = tmp.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
+    for ((out, (path, tmp)), s) in outs.iter_mut().zip(tmps).zip(&state) {
+        let mut tmp = tmp.into_inner().map_err(|e| e.to_string())?;
+        tmp.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        loop {
+            let n = tmp.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         }
-        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        drop(tmp);
+        let _ = std::fs::remove_file(&path);
+        for fr in &s.rel_frames {
+            out.write_all(fr).map_err(|e| e.to_string())?;
+        }
+        out.flush().map_err(|e| e.to_string())?;
     }
-    drop(tmp);
-    let _ = std::fs::remove_file(&tmp_path);
-    for fr in &rel_frames {
-        out.write_all(fr).map_err(|e| e.to_string())?;
-    }
-    out.flush().map_err(|e| e.to_string())?;
-    Ok(stats)
+    Ok(state.into_iter().map(|s| s.stats).collect())
 }
