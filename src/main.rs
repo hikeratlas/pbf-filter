@@ -23,7 +23,9 @@ const USAGE: &str = "usage:
       allows, each group needing a bitmap of node ids (one bit per id).
   pbf-filter merge OUTPUT.osm.pbf INPUT.osm.pbf INPUT.osm.pbf [...]
       Sorted PBFs (e.g. neighbouring extracts) as one sorted PBF, with one
-      copy of what's in more than one.
+      copy of what's in more than one. Filtered PBFs (made with the same
+      profiles) or relations sidecars of neighbouring extracts merge into
+      what filtering, or `relations` on, the merged extract would give.
   pbf-filter recompress INPUT.osm.pbf OUTPUT.osm.pbf
       The same data, without metadata (versions, timestamps, changesets,
       users), in zstd blocks.

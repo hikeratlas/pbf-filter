@@ -5,7 +5,9 @@
 //!
 //! `merge`: several sorted PBFs (e.g. Geofabrik's extracts of neighbouring
 //! countries) as one sorted PBF, with one copy of what's in more than one
-//! (the objects along their border, the same in each).
+//! (the objects along their border, the same in each). Filtered PBFs (or
+//! relations sidecars) of neighbouring extracts merge into what filtering
+//! (or `relations` on) the merged extract gives, record included.
 
 use crate::header;
 use crate::pbf::{self, Block, BlobRef, Kind, Member};
@@ -165,16 +167,50 @@ impl Cursor {
     }
 }
 
+/// The record for a merge of files with these records: none if none has
+/// one; else they must all be filtered PBFs made with the same rules, or all
+/// relations sidecars, and the sources' sizes add up (so a merge of filtered
+/// PBFs and a merge of their sidecars still match in `check`).
+fn merged_record(inputs: &[String], records: &[Option<serde_json::Value>]) -> Result<Option<serde_json::Value>, String> {
+    if records.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let mut all = vec![];
+    for (path, r) in inputs.iter().zip(records) {
+        all.push(r.as_ref().ok_or_else(|| format!("{path} has no pbf-filter record, but other inputs do"))?);
+    }
+    let mut source_bytes = 0u64;
+    for (path, r) in inputs.iter().zip(&all) {
+        source_bytes += r["source_bytes"].as_u64().ok_or_else(|| format!("{path}: no source_bytes in its record"))?;
+    }
+    let first = all[0];
+    if all.iter().all(|r| r["relations"] == true) {
+        return Ok(Some(serde_json::json!({ "source_bytes": source_bytes, "relations": true })));
+    }
+    for (path, r) in inputs.iter().zip(&all) {
+        if r["relations"] == true || r["profiles"].is_null() {
+            return Err(format!("{path} isn't the same kind of file as {} (filtered PBF or relations sidecar)", inputs[0]));
+        }
+        if r["profiles"] != first["profiles"] {
+            return Err(format!("{path} was filtered with different profiles from {}", inputs[0]));
+        }
+    }
+    Ok(Some(serde_json::json!({ "source_bytes": source_bytes, "profiles": first["profiles"] })))
+}
+
 pub fn merge(inputs: &[String], output: &str, c: Compression) -> Result<(), String> {
     let mut cursors = vec![];
+    let mut records = vec![];
     for path in inputs {
-        let (_, rx) = reader(path.clone())?;
+        let (head, rx) = reader(path.clone())?;
+        records.push(header::record(&head));
         let mut cur = Cursor { rx, buf: vec![].into_iter(), head: None };
         cur.advance()?;
         cursors.push(cur);
     }
+    let record = merged_record(inputs, &records)?;
     let mut out = BufWriter::new(File::create(output).map_err(|e| format!("{output}: {e}"))?);
-    out.write_all(&frame("OSMHeader", &header::header_block(None, true, None), c)).map_err(|e| e.to_string())?;
+    out.write_all(&frame("OSMHeader", &header::header_block(None, true, record.as_ref()), c)).map_err(|e| e.to_string())?;
     let (mut b, mut kind, mut raw_blocks) = (BlockBuilder::new(), None, vec![]);
     let flush = |raw: &mut Vec<Vec<u8>>, out: &mut BufWriter<File>| -> Result<(), String> {
         let frames: Vec<Vec<u8>> = raw.par_iter().map(|r| frame("OSMData", r, c)).collect();
