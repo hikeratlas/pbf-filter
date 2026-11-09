@@ -141,7 +141,7 @@ pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -
     let blobs = pbf::index(data)?;
     let header = blobs.iter().position(|b| b.is_header).ok_or("no OSMHeader block")?;
     let head = pbf::read_blob(data, &blobs[header])?;
-    if !String::from_utf8_lossy(&head).contains("Sort.Type_then_ID") {
+    if !crate::header::is_sorted(&head) {
         return Err(format!("{input} isn't marked sorted (Sort.Type_then_ID)"));
     }
     let start = header + 1;
@@ -255,8 +255,7 @@ pub fn filter(input: &str, output: &str, profiles: &[Profile], c: Compression) -
 
     // 3. Nodes, then the ways and relations after them.
     let mut out = BufWriter::new(File::create(output).map_err(|e| format!("{output}: {e}"))?);
-    let (fs, fe) = blobs[header].frame;
-    out.write_all(&data[fs..fe]).map_err(|e| e.to_string())?;
+    out.write_all(&frame("OSMHeader", &crate::header::header_block(Some(&head), true), c)).map_err(|e| e.to_string())?;
     let node_counts = (AtomicU64::new(0), AtomicU64::new(0));
     pass(data, node_blobs, c, &mut out, |block, b, full| {
         block.nodes(|n| {

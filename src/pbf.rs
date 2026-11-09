@@ -12,8 +12,6 @@ pub type Result<T> = std::result::Result<T, String>;
 /// Where a blob's bytes are in the file.
 #[derive(Clone, Copy, Debug)]
 pub struct BlobRef {
-    /// The whole frame (length, BlobHeader, Blob), for copying it as is.
-    pub frame: (usize, usize),
     /// The Blob message.
     pub blob: (usize, usize),
     pub is_header: bool,
@@ -38,7 +36,7 @@ pub fn index(data: &[u8]) -> Result<Vec<BlobRef>> {
         if start + size > data.len() {
             return Err(format!("truncated Blob at byte {pos}"));
         }
-        out.push(BlobRef { frame: (pos, start + size), blob: (start, start + size), is_header: kind == b"OSMHeader" });
+        out.push(BlobRef { blob: (start, start + size), is_header: kind == b"OSMHeader" });
         pos = start + size;
     }
     Ok(out)
