@@ -11,10 +11,11 @@
 
 use crate::header;
 use crate::pbf::{self, Block, BlobRef, Kind, Member};
-use crate::write::{BlockBuilder, Compression, frame};
+use crate::write::{BLOCK_SIZE, BlockBuilder, Compression, frame};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
 
 /// Blocks decoded or compressed at a time, across the cores.
@@ -67,11 +68,20 @@ pub fn recompress(input: &str, output: &str, c: Compression) -> Result<(), Strin
 
 // ---- merge -----------------------------------------------------------------
 
+/// A block's string table, shared by the entities decoded from it, so an
+/// entity's tags are indices rather than strings of their own: decoding
+/// allocates per block, not per tag.
+type Strings = Arc<Vec<Box<[u8]>>>;
+
 /// An entity, owned, for merging across files.
 enum Entity {
-    Node { id: i64, lat: i64, lon: i64, tags: Vec<(Vec<u8>, Vec<u8>)> },
-    Way { id: i64, tags: Vec<(Vec<u8>, Vec<u8>)>, refs: Vec<i64> },
-    Relation { id: i64, tags: Vec<(Vec<u8>, Vec<u8>)>, members: Vec<(Member, i64, Vec<u8>)> },
+    Node { id: i64, lat: i64, lon: i64, tags: Vec<(u32, u32)>, s: Strings },
+    Way { id: i64, tags: Vec<(u32, u32)>, refs: Vec<i64>, s: Strings },
+    Relation { id: i64, tags: Vec<(u32, u32)>, members: Vec<(Member, i64, u32)>, s: Strings },
+}
+
+fn string(s: &Strings, i: u32) -> &[u8] {
+    s.get(i as usize).map_or(&[][..], |b| &b[..])
 }
 
 impl Entity {
@@ -83,35 +93,25 @@ impl Entity {
         }
     }
     fn add_to(&self, b: &mut BlockBuilder) {
-        fn t(tags: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], &[u8])> {
-            tags.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect()
+        fn t<'a>(s: &'a Strings, tags: &'a [(u32, u32)]) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+            tags.iter().map(move |&(k, v)| (string(s, k), string(s, v)))
         }
         match self {
-            Entity::Node { id, lat, lon, tags } => b.add_node(*id, *lat, *lon, t(tags)),
-            Entity::Way { id, tags, refs } => b.add_way(*id, t(tags), refs),
-            Entity::Relation { id, tags, members } => {
-                b.add_relation(*id, t(tags), members.iter().map(|(m, id, role)| (*m, *id, role.as_slice())))
+            Entity::Node { id, lat, lon, tags, s } => b.add_node(*id, *lat, *lon, t(s, tags)),
+            Entity::Way { id, tags, refs, s } => b.add_way(*id, t(s, tags), refs),
+            Entity::Relation { id, tags, members, s } => {
+                b.add_relation(*id, t(s, tags), members.iter().map(|&(m, id, role)| (m, id, string(s, role))))
             }
         }
     }
 }
 
-fn owned_tags(block: &Block, t: &[(u32, u32)]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    t.iter().map(|&(k, v)| (block.string(k).to_vec(), block.string(v).to_vec())).collect()
-}
-
 fn entities(block: &Block) -> Vec<Entity> {
-    let tags = |t: &[(u32, u32)]| owned_tags(block, t);
+    let s: Strings = Arc::new(block.strings.iter().map(|x| Box::<[u8]>::from(*x)).collect());
     let mut out = vec![];
-    block.nodes(|n| out.push(Entity::Node { id: n.id, lat: n.lat, lon: n.lon, tags: tags(&n.tags) }));
-    block.ways(|w| out.push(Entity::Way { id: w.id, tags: tags(&w.tags), refs: w.refs }));
-    block.relations(|r| {
-        out.push(Entity::Relation {
-            id: r.id,
-            tags: tags(&r.tags),
-            members: r.members.iter().map(|&(m, id, role)| (m, id, block.string(role).to_vec())).collect(),
-        })
-    });
+    block.nodes(|n| out.push(Entity::Node { id: n.id, lat: n.lat, lon: n.lon, tags: n.tags, s: s.clone() }));
+    block.ways(|w| out.push(Entity::Way { id: w.id, tags: w.tags, refs: w.refs, s: s.clone() }));
+    block.relations(|r| out.push(Entity::Relation { id: r.id, tags: r.tags, members: r.members, s: s.clone() }));
     out
 }
 
@@ -211,14 +211,36 @@ pub fn merge(inputs: &[String], output: &str, c: Compression) -> Result<(), Stri
     let record = merged_record(inputs, &records)?;
     let mut out = BufWriter::new(File::create(output).map_err(|e| format!("{output}: {e}"))?);
     out.write_all(&frame("OSMHeader", &header::header_block(None, true, record.as_ref()), c)).map_err(|e| e.to_string())?;
-    let (mut b, mut kind, mut raw_blocks) = (BlockBuilder::new(), None, vec![]);
-    let flush = |raw: &mut Vec<Vec<u8>>, out: &mut BufWriter<File>| -> Result<(), String> {
-        let frames: Vec<Vec<u8>> = raw.par_iter().map(|r| frame("OSMData", r, c)).collect();
-        raw.clear();
-        for f in frames {
-            out.write_all(&f).map_err(|e| e.to_string())?;
+    let c = c;
+    // The merge itself only orders the entities and drops duplicates, into
+    // batches of a block's worth (a new one at each change of kind, as a
+    // builder would start a new block); encoding and compressing each batch
+    // is the costly part, done a window of batches at a time in parallel.
+    let (mut batch, mut kind, mut batches): (Vec<Entity>, _, Vec<Vec<Entity>>) = (Vec::with_capacity(BLOCK_SIZE), None, vec![]);
+    // Encoding and writing run on a thread of their own, so the merge
+    // doesn't wait for them (nor, through it, the readers).
+    let (tx, rx) = sync_channel::<Vec<Vec<Entity>>>(2);
+    let writer = std::thread::spawn(move || -> Result<(), String> {
+        for window in rx {
+            let frames: Vec<Vec<u8>> = window
+                .par_iter()
+                .map(|entities| {
+                    let mut b = BlockBuilder::new();
+                    for e in entities {
+                        e.add_to(&mut b);
+                    }
+                    frame("OSMData", &b.finish(), c)
+                })
+                .collect();
+            drop(window);
+            for f in frames {
+                out.write_all(&f).map_err(|e| e.to_string())?;
+            }
         }
-        Ok(())
+        out.flush().map_err(|e| e.to_string())
+    });
+    let flush = |batches: &mut Vec<Vec<Entity>>| -> Result<(), String> {
+        tx.send(std::mem::take(batches)).map_err(|_| "the writer stopped".to_string())
     };
     loop {
         // The smallest (kind, id) at the head of any input: written once,
@@ -228,26 +250,27 @@ pub fn merge(inputs: &[String], output: &str, c: Compression) -> Result<(), Stri
         for cur in cursors.iter_mut() {
             if cur.head.as_ref().map(|e| e.key()) == Some(min) {
                 if !written {
-                    if kind != Some(min.0) && b.len() > 0 {
-                        raw_blocks.push(b.finish());
+                    if kind != Some(min.0) && !batch.is_empty() {
+                        batches.push(std::mem::replace(&mut batch, Vec::with_capacity(BLOCK_SIZE)));
                     }
                     kind = Some(min.0);
-                    cur.head.as_ref().unwrap().add_to(&mut b);
-                    if b.is_full() {
-                        raw_blocks.push(b.finish());
+                    batch.push(cur.head.take().unwrap());
+                    if batch.len() >= BLOCK_SIZE {
+                        batches.push(std::mem::replace(&mut batch, Vec::with_capacity(BLOCK_SIZE)));
                     }
                     written = true;
                 }
                 cur.advance()?;
             }
         }
-        if raw_blocks.len() >= WINDOW {
-            flush(&mut raw_blocks, &mut out)?;
+        if batches.len() >= WINDOW {
+            flush(&mut batches)?;
         }
     }
-    if b.len() > 0 {
-        raw_blocks.push(b.finish());
+    if !batch.is_empty() {
+        batches.push(batch);
     }
-    flush(&mut raw_blocks, &mut out)?;
-    out.flush().map_err(|e| e.to_string())
+    flush(&mut batches)?;
+    drop(tx);
+    writer.join().map_err(|_| "the writer panicked".to_string())?
 }
