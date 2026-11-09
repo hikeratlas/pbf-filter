@@ -42,6 +42,11 @@ options:
   --zlib       write zlib blocks (default: zstd, which cldellow/tilemaker reads)
   --level N    compression level (default: zstd 3, zlib 6)
   --per-pass N groups to write per read of INPUT (default: as memory allows)
+  --node-index full|ranked|auto
+               how groups mark kept nodes: a bitmap over every possible id
+               (about 1.8 GB each), or, after a read of INPUT's node ids,
+               one bit per node in it (default auto: full if every group
+               fits at once)
 
 Every command drops metadata, which tilemaker doesn't read.";
 
@@ -114,11 +119,20 @@ fn main() {
     };
     let cmd = args.first().cloned().unwrap_or_default();
     let (mut zlib, mut level, mut per_pass, mut pos) = (false, None, None, vec![]);
+    let mut node_index = filter::NodeIndex::Auto;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--zlib" => zlib = true,
             "--level" => level = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| die("--level N"))),
+            "--node-index" => {
+                node_index = match it.next().map(String::as_str) {
+                    Some("full") => filter::NodeIndex::Full,
+                    Some("ranked") => filter::NodeIndex::Ranked,
+                    Some("auto") => filter::NodeIndex::Auto,
+                    _ => die("--node-index full|ranked|auto"),
+                }
+            }
             "--per-pass" => {
                 per_pass = Some(it.next().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or_else(|| die("--per-pass N")))
             }
@@ -144,7 +158,7 @@ fn main() {
             let groups = read_groups(Path::new(&pos[1]), Path::new(&pos[2]), c).unwrap_or_else(|e| fail(e));
             std::fs::create_dir_all(&pos[2]).unwrap_or_else(|e| fail(format!("{}: {e}", pos[2])));
             let outputs: Vec<String> = groups.iter().map(|g| g.output.clone()).collect();
-            let stats = filter::filter_groups(&pos[0], groups, c, per_pass).unwrap_or_else(|e| fail(e));
+            let stats = filter::filter_groups(&pos[0], groups, c, per_pass, node_index).unwrap_or_else(|e| fail(e));
             for (o, s) in outputs.iter().zip(&stats) {
                 report(o, s);
             }
