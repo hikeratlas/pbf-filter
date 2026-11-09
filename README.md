@@ -35,7 +35,10 @@ relation. No extra declarations.
   sidecar, every relation's tags) must be in it. Logic changes, and scan
   functions accepting fewer relations, don't make it stale.
 - `merge` combines sorted PBFs (e.g. neighbouring extracts), keeping one
-  copy of what's in more than one; `recompress` rewrites one with zstd
+  copy of what's in more than one. Merging neighbours' filtered PBFs (made
+  with the same profiles), or their `relations` sidecars, gives what
+  filtering the merged extract would, record included, so `check` works on
+  the result; `recompress` rewrites one with zstd
   blocks. Every command drops metadata (versions, timestamps, users),
   which tilemaker doesn't read.
 
