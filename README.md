@@ -16,6 +16,7 @@ relation. No extra declarations.
     pbf-filter check FILTERED.osm.pbf RELATIONS.pbf PROFILE.lua [PROFILE.lua ...]
     pbf-filter merge OUTPUT.osm.pbf INPUT.osm.pbf INPUT.osm.pbf [...]
     pbf-filter recompress INPUT.osm.pbf OUTPUT.osm.pbf
+    pbf-filter clip W,S,E,N INPUT.geojsonl OUTPUT.geojsonl [--margin DEG]
 
 - `filter` reads each block of a sorted PBF once (relations, then ways,
   then nodes, in parallel) and writes zstd blocks (`--zlib` for zlib),
@@ -41,6 +42,13 @@ relation. No extra declarations.
   the result; `recompress` rewrites one with zstd
   blocks. Every command drops metadata (versions, timestamps, users),
   which tilemaker doesn't read.
+- `clip` isn't about PBFs: it keeps the features of a GeoJSON-lines file
+  (one feature per line, as tilemaker exports write) whose bounds reach a
+  box, grown by `--margin` degrees, in order. Bounds come from the
+  coordinates' text, in parallel, without parsing JSON: north-america's
+  trails export (1 GB, 2.1 million features) clips in about 0.6 s. A line
+  whose coordinates can't be read is kept. hikeratlas/basemap clips a
+  preview's copy of north-america's exports to the preview's box.
 
 Releases publish Linux binaries for x86_64 and arm64: run the Release
 workflow with a version (it tags the commit), or push a `v*` tag.

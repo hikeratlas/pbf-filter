@@ -1,4 +1,5 @@
 mod check;
+mod clip;
 mod copy;
 mod filter;
 mod header;
@@ -37,6 +38,11 @@ const USAGE: &str = "usage:
       changed since: exits 0 if so, 3 (saying why) if they'd read something
       it may not have, so a build can fall back to the whole PBF. RELATIONS
       is the sidecar from the same PBF.
+  pbf-filter clip W,S,E,N INPUT.geojsonl OUTPUT.geojsonl [--margin DEG]
+      The features of a GeoJSON-lines file (one per line) whose bounds
+      reach the box, grown by DEG degrees on each side (default 0), in
+      order. Bounds come from the coordinates' text; a line whose
+      coordinates can't be read is kept.
 
 options:
   --zlib       write zlib blocks (default: zstd, which cldellow/tilemaker reads)
@@ -120,6 +126,7 @@ fn main() {
     let cmd = args.first().cloned().unwrap_or_default();
     let (mut zlib, mut level, mut per_pass, mut pos) = (false, None, None, vec![]);
     let mut node_index = filter::NodeIndex::Auto;
+    let mut margin = 0.0f64;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -136,6 +143,10 @@ fn main() {
             "--per-pass" => {
                 per_pass = Some(it.next().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or_else(|| die("--per-pass N")))
             }
+            "--margin" => {
+                margin = it.next().and_then(|v| v.parse().ok()).filter(|m: &f64| *m >= 0.0).unwrap_or_else(|| die("--margin DEG"))
+            }
+            // A negative longitude is a box, not an option.
             _ if a.starts_with("--") => die(&format!("unknown option {a}")),
             _ => pos.push(a.clone()),
         }
@@ -199,6 +210,21 @@ fn main() {
                     std::process::exit(3)
                 }
             }
+        }
+        "clip" => {
+            if pos.len() != 3 {
+                die("clip needs W,S,E,N, INPUT and OUTPUT");
+            }
+            let b: Vec<f64> = pos[0].split(',').map(|v| v.trim().parse().unwrap_or_else(|_| die("clip needs a box W,S,E,N"))).collect();
+            if b.len() != 4 || b[0] > b[2] || b[1] > b[3] {
+                die("clip needs a box W,S,E,N");
+            }
+            let bx = [b[0] - margin, b[1] - margin, b[2] + margin, b[3] + margin];
+            let s = clip::clip(&pos[1], &pos[2], bx).unwrap_or_else(|e| fail(e));
+            eprintln!(
+                "{}: {} of {} features ({} unread, kept), {:.1} of {:.1} MB; {:.1}s",
+                pos[2], s.kept, s.lines, s.unread, size(&pos[2]), size(&pos[1]), t0.elapsed().as_secs_f64()
+            );
         }
         _ => die("unknown command"),
     }
