@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 flate2 = "1"
+memchr = "2"
 memmap2 = "0.9"
 mlua = { version = "0.10", features = ["luajit", "vendored"] }
 rayon = "1"

@@ -278,6 +278,7 @@ name = "pbf-filter"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "memchr",
  "memmap2",
  "mlua",
  "rayon",
